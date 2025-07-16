@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Diagnostics;
+using System.IO;
 using System.IO.Ports;
 using System.Net;
 using System.Text;
@@ -78,13 +79,25 @@ namespace TerminalCardReader
             _elapsedMilliseconds = -1;
             isCardEnd = false;
 
-            _crtPort = new SerialPort("COM5", 9600, Parity.None, 8, StopBits.One)
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string crtPortFile = Path.Combine(baseDir, "crt_port.txt");
+            string rfidPortFile = Path.Combine(baseDir, "rfid_port.txt");
+
+            string crtPortName = "COM5";
+            string rfidPortName = "COM4";
+
+            if (File.Exists(crtPortFile))
+                crtPortName = File.ReadAllText(crtPortFile).Trim();
+            if (File.Exists(rfidPortFile))
+                rfidPortName = File.ReadAllText(rfidPortFile).Trim();
+
+            _crtPort = new SerialPort(crtPortName, 9600, Parity.None, 8, StopBits.One)
             {
                 ReadTimeout = 1000,
                 WriteTimeout = 1000
             };
 
-            _rfidPort = new SerialPort("COM4", 9600, Parity.None, 8, StopBits.One);
+            _rfidPort = new SerialPort(rfidPortName, 9600, Parity.None, 8, StopBits.One);
             _rfidPort.DataReceived += (s, e) =>
             {
                 try
