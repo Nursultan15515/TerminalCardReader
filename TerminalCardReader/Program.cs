@@ -1,4 +1,4 @@
-п»їusing System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Ports;
@@ -6,13 +6,13 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
-using JsonSerializer = System.Text.Json.JsonSerializer;
+using System.Threading.Tasks;
 
 namespace TerminalCardReader
 {
     class Program
     {
-        static object _lock = new object();
+        static SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
         static SerialPort _crtPort;
         static SerialPort _rfidPort;
         static string _rfidUid = null;
@@ -26,16 +26,16 @@ namespace TerminalCardReader
             HttpListener listener = new HttpListener();
             listener.Prefixes.Add("http://localhost:8080/issue-card/");
             listener.Start();
-            Console.WriteLine("рџџў РЎРµСЂРІРµСЂ Р·Р°РїСѓС‰РµРЅ: http://localhost:8080/issue-card/");
+            Console.WriteLine("?? Сервер запущен: http://localhost:8080/issue-card/");
 
             while (true)
             {
                 HttpListenerContext context = listener.GetContext();
-                ThreadPool.QueueUserWorkItem(o => HandleRequest(context));
+                _ = Task.Run(() => HandleRequestAsync(context));
             }
         }
 
-        static void HandleRequest(HttpListenerContext context)
+        static async Task HandleRequestAsync(HttpListenerContext context)
         {
             var response = context.Response;
             try
@@ -53,11 +53,10 @@ namespace TerminalCardReader
                     return;
                 }
 
-                object result;
-                lock (_lock)
-                {
-                    result = RunCardLogic();
-                } // вљЎ Р’РѕР·РІСЂР°С‰Р°РµС‚ Р±С‹СЃС‚СЂРѕ
+                await _semaphore.WaitAsync(); // Блокировка
+
+                var result = RunCardLogic(); // JSON возвращается быстро
+
                 string json = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
                 byte[] buffer = Encoding.UTF8.GetBytes(json);
                 response.ContentType = "application/json";
@@ -74,6 +73,7 @@ namespace TerminalCardReader
             finally
             {
                 response.OutputStream.Close();
+                // ? Не освобождаем семафор здесь — только после возврата карты!
             }
         }
 
@@ -142,7 +142,7 @@ namespace TerminalCardReader
                 while (attempt < maxAttempts && !_rfidReceived)
                 {
                     attempt++;
-                    Console.WriteLine($"рџ”Ѓ РџРѕРїС‹С‚РєР° #{attempt}");
+                    Console.WriteLine($"?? Попытка #{attempt}");
 
                     ExecuteFCCommand(2);
 
@@ -157,44 +157,49 @@ namespace TerminalCardReader
 
                     if (_rfidReceived)
                     {
-                        Console.WriteLine("вњ… UID РїРѕР»СѓС‡РµРЅ: " + _rfidUid);
+                        Console.WriteLine("? UID получен: " + _rfidUid);
                         ExecuteCommandWithEnq("DC");
 
-                        // вќ— Р’РµСЂРЅСѓС‚СЊ РєР°СЂС‚Сѓ РІ С„РѕРЅРѕРІРѕРј РїРѕС‚РѕРєРµ
-                        new Thread(() =>
+                        // ? Возврат карты и Release после 15 сек
+                        Task.Run(() =>
                         {
                             try
                             {
-                                Console.WriteLine("вЏі РћР¶РёРґР°РЅРёРµ 15 СЃРµРєСѓРЅРґ РїРµСЂРµРґ РІРѕР·РІСЂР°С‚РѕРј...");
+                                Console.WriteLine("? Ожидание 15 секунд перед возвратом...");
                                 Thread.Sleep(15000);
                                 ExecuteCommandWithEnq("CP");
-                                Console.WriteLine("в†© РљР°СЂС‚Р° РІРѕР·РІСЂР°С‰РµРЅР°.");
+                                Console.WriteLine("? Карта возвращена.");
                             }
                             catch (Exception ex)
                             {
-                                Console.WriteLine("вљ  РћС€РёР±РєР° РІРѕР·РІСЂР°С‚Р° РєР°СЂС‚С‹: " + ex.Message);
+                                Console.WriteLine("? Ошибка возврата карты: " + ex.Message);
                             }
                             finally
                             {
-                                if (_crtPort.IsOpen) _crtPort.Close();
-                                if (_rfidPort.IsOpen) _rfidPort.Close();
+                                if (_crtPort?.IsOpen == true) _crtPort.Close();
+                                if (_rfidPort?.IsOpen == true) _rfidPort.Close();
+
+                                // ? Семафор освобождаем ТОЛЬКО здесь
+                                _semaphore.Release();
                             }
-                        }).Start();
+                        });
 
                         success = true;
                         break;
                     }
                     else
                     {
-                        Console.WriteLine("вќЊ UID РЅРµ РїРѕР»СѓС‡РµРЅ, РІРѕР·РІСЂР°С‚ РєР°СЂС‚С‹...");
+                        Console.WriteLine("? UID не получен, возврат карты...");
                         ExecuteCommandWithEnq("CP");
                         _crtPort.Close();
                         _rfidPort.Close();
+                        _semaphore.Release(); // ? Освобождаем сразу при неудаче
                     }
                 }
             }
             catch (Exception ex)
             {
+                _semaphore.Release(); // ?? При критической ошибке — тоже отпускаем
                 return new
                 {
                     success = false,
