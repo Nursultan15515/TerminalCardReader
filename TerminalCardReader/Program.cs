@@ -12,6 +12,7 @@ namespace TerminalCardReader
 {
     class Program
     {
+        static object _lock = new object();
         static SerialPort _crtPort;
         static SerialPort _rfidPort;
         static string _rfidUid = null;
@@ -52,7 +53,11 @@ namespace TerminalCardReader
                     return;
                 }
 
-                var result = RunCardLogic();
+                object result;
+                lock (_lock)
+                {
+                    result = RunCardLogic();
+                } // ⚡ Возвращает быстро
                 string json = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
                 byte[] buffer = Encoding.UTF8.GetBytes(json);
                 response.ContentType = "application/json";
@@ -83,13 +88,8 @@ namespace TerminalCardReader
             string crtPortFile = Path.Combine(baseDir, "crt_port.txt");
             string rfidPortFile = Path.Combine(baseDir, "rfid_port.txt");
 
-            string crtPortName = "COM5";
-            string rfidPortName = "COM4";
-
-            if (File.Exists(crtPortFile))
-                crtPortName = File.ReadAllText(crtPortFile).Trim();
-            if (File.Exists(rfidPortFile))
-                rfidPortName = File.ReadAllText(rfidPortFile).Trim();
+            string crtPortName = File.Exists(crtPortFile) ? File.ReadAllText(crtPortFile).Trim() : "COM5";
+            string rfidPortName = File.Exists(rfidPortFile) ? File.ReadAllText(rfidPortFile).Trim() : "COM4";
 
             _crtPort = new SerialPort(crtPortName, 9600, Parity.None, 8, StopBits.One)
             {
@@ -114,10 +114,7 @@ namespace TerminalCardReader
                             if (data.StartsWith("HID["))
                             {
                                 var parts = data.Split(' ');
-                                if (parts.Length > 1)
-                                    _rfidUid = parts[1];
-                                else
-                                    _rfidUid = data;
+                                _rfidUid = parts.Length > 1 ? parts[1] : data;
                             }
                             else
                             {
@@ -163,9 +160,26 @@ namespace TerminalCardReader
                         Console.WriteLine("✅ UID получен: " + _rfidUid);
                         ExecuteCommandWithEnq("DC");
 
-                        Console.WriteLine("⏳ Ожидание 15 секунд, чтобы пользователь забрал карту...");
-                        Thread.Sleep(15000);
-                        ExecuteCommandWithEnq("CP");
+                        // ❗ Вернуть карту в фоновом потоке
+                        new Thread(() =>
+                        {
+                            try
+                            {
+                                Console.WriteLine("⏳ Ожидание 15 секунд перед возвратом...");
+                                Thread.Sleep(15000);
+                                ExecuteCommandWithEnq("CP");
+                                Console.WriteLine("↩ Карта возвращена.");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine("⚠ Ошибка возврата карты: " + ex.Message);
+                            }
+                            finally
+                            {
+                                if (_crtPort.IsOpen) _crtPort.Close();
+                                if (_rfidPort.IsOpen) _rfidPort.Close();
+                            }
+                        }).Start();
 
                         success = true;
                         break;
@@ -174,6 +188,8 @@ namespace TerminalCardReader
                     {
                         Console.WriteLine("❌ UID не получен, возврат карты...");
                         ExecuteCommandWithEnq("CP");
+                        _crtPort.Close();
+                        _rfidPort.Close();
                     }
                 }
             }
@@ -188,13 +204,6 @@ namespace TerminalCardReader
                     isCardEnd = isCardEnd,
                     attempts = attempt
                 };
-            }
-            finally
-            {
-                if (_crtPort.IsOpen)
-                    _crtPort.Close();
-                if (_rfidPort.IsOpen)
-                    _rfidPort.Close();
             }
 
             return new
@@ -214,7 +223,7 @@ namespace TerminalCardReader
             if (ReadAck())
             {
                 Thread.Sleep(100);
-                _crtPort.Write(new byte[] { 0x05 }, 0, 1); // ENQ
+                _crtPort.Write(new byte[] { 0x05 }, 0, 1);
                 Thread.Sleep(400);
             }
         }
