@@ -142,7 +142,7 @@ namespace TerminalCardReader
                 while (attempt < maxAttempts && !_rfidReceived)
                 {
                     attempt++;
-                    Console.WriteLine($"?? Попытка #{attempt}");
+                    Logger.WriteLog($"?? Попытка #{attempt}");
 
                     ExecuteFCCommand(2);
 
@@ -157,7 +157,7 @@ namespace TerminalCardReader
 
                     if (_rfidReceived)
                     {
-                        Console.WriteLine("? UID получен: " + _rfidUid);
+                        Logger.WriteLog("? UID получен: " + _rfidUid);
                         ExecuteCommandWithEnq("DC");
 
                         // ? Возврат карты и Release после 15 сек
@@ -165,14 +165,14 @@ namespace TerminalCardReader
                         {
                             try
                             {
-                                Console.WriteLine("? Ожидание 15 секунд перед возвратом...");
+                                Logger.WriteLog("? Ожидание 15 секунд перед возвратом...");
                                 Thread.Sleep(15000);
                                 ExecuteCommandWithEnq("CP");
-                                Console.WriteLine("? Карта возвращена.");
+                                Logger.WriteLog("? Карта возвращена.");
                             }
                             catch (Exception ex)
                             {
-                                Console.WriteLine("? Ошибка возврата карты: " + ex.Message);
+                                Logger.WriteLog("? Ошибка возврата карты: " + ex.Message);
                             }
                             finally
                             {
@@ -189,7 +189,7 @@ namespace TerminalCardReader
                     }
                     else
                     {
-                        Console.WriteLine("? UID не получен, возврат карты...");
+                        Logger.WriteLog("? UID не получен, возврат карты...");
                         ExecuteCommandWithEnq("CP");
                         _crtPort.Close();
                         _rfidPort.Close();
