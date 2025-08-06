@@ -26,7 +26,7 @@ namespace TerminalCardReader
             HttpListener listener = new HttpListener();
             listener.Prefixes.Add("http://localhost:8080/issue-card/");
             listener.Start();
-            Console.WriteLine("?? Сервер запущен: http://localhost:8080/issue-card/");
+            Console.WriteLine("Сервер запущен: http://localhost:8080/issue-card/");
 
             while (true)
             {
@@ -147,7 +147,7 @@ namespace TerminalCardReader
                     ExecuteFCCommand(2);
 
                     stopwatch = Stopwatch.StartNew();
-                    int timeout = 7000;
+                    int timeout = 10000;
                     int waited = 0;
                     while (!_rfidReceived && waited < timeout)
                     {
@@ -165,8 +165,8 @@ namespace TerminalCardReader
                         {
                             try
                             {
-                                Logger.WriteLog("? Ожидание 15 секунд перед возвратом...");
-                                Thread.Sleep(15000);
+                                Logger.WriteLog("? Ожидание 17 секунд перед возвратом...");
+                                Thread.Sleep(17000);
                                 ExecuteCommandWithEnq("CP");
                                 Logger.WriteLog("? Карта возвращена.");
                             }
