@@ -25,14 +25,24 @@ namespace TerminalCardReader
         {
             HttpListener listener = new HttpListener();
             listener.Prefixes.Add("http://localhost:8080/issue-card/");
+            listener.Prefixes.Add("http://localhost:8080/card-status/");
             listener.Start();
             Console.WriteLine("Сервер запущен: http://localhost:8080/issue-card/");
 
             while (true)
             {
                 HttpListenerContext context = listener.GetContext();
-                _ = Task.Run(() => HandleRequestAsync(context));
+                _ = Task.Run(() =>
+                {
+                    if (context.Request.Url.AbsolutePath == "/issue-card/")
+                        HandleRequestAsync(context);
+                    else if (context.Request.Url.AbsolutePath == "/card-status/")
+                        HandleStatusRequestAsync(context);
+                    else
+                        context.Response.StatusCode = 404;
+                });
             }
+
         }
 
         static async Task HandleRequestAsync(HttpListenerContext context)
@@ -206,7 +216,6 @@ namespace TerminalCardReader
                     uid = (string)null,
                     error = ex.Message,
                     elapsedMilliseconds = _elapsedMilliseconds >= 0 ? _elapsedMilliseconds : null,
-                    isCardEnd = isCardEnd,
                     attempts = attempt
                 };
             }
@@ -271,6 +280,78 @@ namespace TerminalCardReader
                 return bytesRead > 0 && response[0] == 0x06;
             }
             catch { return false; }
+        }
+
+        static async Task HandleStatusRequestAsync(HttpListenerContext context)
+        {
+            var response = context.Response;
+            try
+            {
+                response.AddHeader("Access-Control-Allow-Origin", "*");
+                response.AddHeader("Access-Control-Allow-Headers", "*");
+                response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string crtPortFile = Path.Combine(baseDir, "crt_port.txt");
+                string crtPortName = File.Exists(crtPortFile) ? File.ReadAllText(crtPortFile).Trim() : "COM5";
+
+                int status = 0;
+
+                using (var port = new SerialPort(crtPortName, 9600, Parity.None, 8, StopBits.One))
+                {
+                    port.ReadTimeout = 1000;
+                    port.WriteTimeout = 1000;
+                    port.Open();
+
+                    byte[] apCommand = new byte[]
+                    {
+                0x02, (byte)'A', (byte)'P', 0x03,
+                (byte)(0x02 ^ (byte)'A' ^ (byte)'P' ^ 0x03)
+                    };
+
+                    port.Write(apCommand, 0, apCommand.Length);
+
+                    byte[] ack = new byte[1];
+                    port.Read(ack, 0, 1);
+                    if (ack[0] != 0x06)
+                        throw new Exception("Нет ACK");
+
+                    Thread.Sleep(50);
+                    port.Write(new byte[] { 0x05 }, 0, 1);
+
+                    Thread.Sleep(100);
+                    byte[] buffer = new byte[12];
+                    int bytesRead = port.Read(buffer, 0, buffer.Length);
+                    if (bytesRead < 7 || buffer[0] != 0x02 || buffer[1] != (byte)'S' || buffer[2] != (byte)'F')
+                        throw new Exception("Неверный формат ответа");
+
+                    byte byte5 = buffer[5];
+                    byte byte6 = buffer[6];
+
+                    bool isPreEmpty = (byte5 & 0x01) != 0; // Byte5, bit 0
+                    bool isEmpty = (byte6 & 0x08) != 0;     // Byte6, bit 3
+
+                    status = isEmpty ? 0 : isPreEmpty ? 1 : 2;
+                }
+
+                var json = JsonSerializer.Serialize(new { status = status });
+                byte[] bufferOut = Encoding.UTF8.GetBytes(json);
+                response.ContentType = "application/json";
+                response.ContentLength64 = bufferOut.Length;
+                await response.OutputStream.WriteAsync(bufferOut, 0, bufferOut.Length);
+            }
+            catch (Exception ex)
+            {
+                var errorJson = JsonSerializer.Serialize(new { status = -1, error = ex.Message });
+                byte[] bufferOut = Encoding.UTF8.GetBytes(errorJson);
+                response.ContentType = "application/json";
+                response.StatusCode = 500;
+                await response.OutputStream.WriteAsync(bufferOut, 0, bufferOut.Length);
+            }
+            finally
+            {
+                response.OutputStream.Close();
+            }
         }
     }
 }
