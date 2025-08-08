@@ -285,6 +285,8 @@ namespace TerminalCardReader
         static async Task HandleStatusRequestAsync(HttpListenerContext context)
         {
             var response = context.Response;
+            await _semaphore.WaitAsync();
+
             try
             {
                 response.AddHeader("Access-Control-Allow-Origin", "*");
@@ -351,6 +353,7 @@ namespace TerminalCardReader
             finally
             {
                 response.OutputStream.Close();
+                _semaphore.Release();
             }
         }
     }
