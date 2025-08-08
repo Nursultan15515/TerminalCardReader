@@ -7,32 +7,34 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Text.Json;
 
 namespace TerminalCardReader
 {
     class Program
     {
-        // Один общий лок, чтобы не пускать параллельные /issue-card и /card-status
-        static readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+        // Лок только для устройства (не для веба)
+        static readonly SemaphoreSlim _deviceLock = new SemaphoreSlim(1, 1);
+
+        // Текущее «ожидание подтверждения»
+        static PendingOp _pending; // одновременно может быть максимум одна операция
 
         static SerialPort _crtPort;
         static SerialPort _rfidPort;
-        static string _rfidUid = null;
-        static long? _elapsedMilliseconds = -1;
-        static Stopwatch stopwatch;
 
         static void Main(string[] args)
         {
             var listener = new HttpListener();
-            listener.Prefixes.Add("http://localhost:8080/issue-card/");
+            listener.Prefixes.Add("http://localhost:8080/issue-card/");       // фаза 1
+            listener.Prefixes.Add("http://localhost:8080/confirm/"); // фаза 2
             listener.Prefixes.Add("http://localhost:8080/card-status/");
             listener.Start();
-            Console.WriteLine("Сервер запущен: http://localhost:8080/issue-card/");
+            Console.WriteLine("Сервер запущен: http://localhost:8080/");
 
             while (true)
             {
-                var context = listener.GetContext();
-                _ = Task.Run(() => RouteAsync(context));
+                var ctx = listener.GetContext();
+                _ = Task.Run(() => RouteAsync(ctx));
             }
         }
 
@@ -49,19 +51,23 @@ namespace TerminalCardReader
 
             try
             {
-                if (req.Url.AbsolutePath == "/issue-card/")
+                var path = req.Url.AbsolutePath;
+                if ((path == "/issue-card" || path == "/issue-card/") && req.HttpMethod == "POST")
                 {
-                    if (req.HttpMethod != "POST") { res.StatusCode = 405; await WriteTextAsync(res, "Method Not Allowed"); return; }
-                    await HandleRequestAsync(context);
+                    await HandleIssueStartAsync(context);
                 }
-                else if (req.Url.AbsolutePath == "/card-status/")
+                else if ((path == "/confirm" || path == "/confirm/") && req.HttpMethod == "POST")
                 {
-                    if (req.HttpMethod != "GET" && req.HttpMethod != "POST") { res.StatusCode = 405; await WriteTextAsync(res, "Method Not Allowed"); return; }
+                    await HandleIssueConfirmAsync(context);
+                }
+                else if (path == "/card-status/" && (req.HttpMethod == "GET" || req.HttpMethod == "POST"))
+                {
                     await HandleStatusRequestAsync(context);
                 }
                 else
                 {
-                    res.StatusCode = 404; await WriteTextAsync(res, "Not Found");
+                    res.StatusCode = 404;
+                    await WriteTextAsync(res, "Not Found");
                 }
             }
             catch (Exception ex)
@@ -74,141 +80,225 @@ namespace TerminalCardReader
             }
         }
 
-        static async Task HandleRequestAsync(HttpListenerContext context)
+        // ---------- ФАЗА 1: читаем RFID, НО карту не плюём ----------
+        static async Task HandleIssueStartAsync(HttpListenerContext context)
         {
-            await _semaphore.WaitAsync(); // блокируем до полного завершения сценария
-            var response = context.Response;
+            var res = context.Response;
+
+            // Если уже есть незавершённая операция — ответим 409
+            if (_pending != null && !_pending.Completed)
+            {
+                res.StatusCode = 409;
+                await WriteJsonAsync(res, new { error = "Operation already pending", operationId = _pending.Id.ToString() });
+                return;
+            }
+
+            await _deviceLock.WaitAsync(); // захватываем железо на всю сессию
 
             try
             {
-                var result = RunCardLogic(); // формируем результат быстро (но лок держим до CP)
-                await WriteJsonAsync(response, result);
-            }
-            catch (Exception ex)
-            {
-                response.StatusCode = 500;
-                await WriteJsonAsync(response, new { success = false, uid = (string)null, error = ex.Message, elapsedMilliseconds = _elapsedMilliseconds });
-            }
-            // НЕ освобождаем семафор здесь — он отпускается внутри фоновой задачи после CP/закрытия портов
-        }
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string crtPortName = ReadOrDefault(Path.Combine(baseDir, "crt_port.txt"), "COM5");
+                string rfidPortName = ReadOrDefault(Path.Combine(baseDir, "rfid_port.txt"), "COM4");
+                int initialWindowMs = ReadOrDefaultInt(Path.Combine(baseDir, "initial_window.txt"), 250);
+                int idleGapMs = ReadOrDefaultInt(Path.Combine(baseDir, "idle_gap.txt"), 120);
+                int confirmTimeout = ReadOrDefaultInt(Path.Combine(baseDir, "confirm_timeout.txt"), 30); // сек
 
-        static object RunCardLogic()
-        {
-            _rfidUid = null;
-            _elapsedMilliseconds = -1;
+                _crtPort = new SerialPort(crtPortName, 9600, Parity.None, 8, StopBits.One)
+                {
+                    ReadTimeout = 1000,
+                    WriteTimeout = 1000
+                };
+                _rfidPort = new SerialPort(rfidPortName, 9600, Parity.None, 8, StopBits.One)
+                {
+                    Encoding = Encoding.ASCII,
+                    ReadTimeout = 80
+                };
 
-            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            string crtPortName = ReadOrDefault(Path.Combine(baseDir, "crt_port.txt"), "COM5");
-            string rfidPortName = ReadOrDefault(Path.Combine(baseDir, "rfid_port.txt"), "COM4");
-            int initialWindowMs = ReadOrDefaultInt(Path.Combine(baseDir, "initial_window.txt"), 250);
-            int idleGapMs = ReadOrDefaultInt(Path.Combine(baseDir, "idle_gap.txt"), 120);
-
-            _crtPort = new SerialPort(crtPortName, 9600, Parity.None, 8, StopBits.One)
-            {
-                ReadTimeout = 1000,
-                WriteTimeout = 1000
-            };
-
-            _rfidPort = new SerialPort(rfidPortName, 9600, Parity.None, 8, StopBits.One)
-            {
-                Encoding = Encoding.ASCII,
-                ReadTimeout = 80
-            };
-
-            bool success = false;
-
-            try
-            {
                 _crtPort.Open();
                 _rfidPort.Open();
 
-                Logger.WriteLog($"→ FC (подача карты), COM CRT={crtPortName}, RFID={rfidPortName}; win={initialWindowMs}/{idleGapMs} мс");
-                ExecuteFCCommand(2);
+                Logger.WriteLog($"→ FC (подача карты), CRT={crtPortName}, RFID={rfidPortName}; win={initialWindowMs}/{idleGapMs} мс");
+                ExecuteFCCommand(_crtPort, 2);
 
-                stopwatch = Stopwatch.StartNew();
+                var sw = Stopwatch.StartNew();
 
-                // Burst-чтение ответа от считывателя
+                // читаем burst ответа от RFID
                 string frame = ReadBurst(_rfidPort, initialWindowMs, idleGapMs);
                 frame = (frame ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
 
+                string uid = null;
                 if (!string.IsNullOrEmpty(frame) && frame.IndexOf("No Card", StringComparison.OrdinalIgnoreCase) < 0)
                 {
-                    // выбрасываем HID[...] и берём последнее число
+                    // Сносим HID[...] и берём ПОСЛЕДНЕЕ число
                     frame = Regex.Replace(frame, @"HID\[[^\]]*\]", "", RegexOptions.IgnoreCase).Trim();
                     var matches = Regex.Matches(frame, @"\b\d+\b");
                     if (matches.Count > 0)
-                    {
-                        _rfidUid = matches[matches.Count - 1].Value;
-                        _elapsedMilliseconds = stopwatch.ElapsedMilliseconds;
-                        success = true;
-                    }
+                        uid = matches[matches.Count - 1].Value;
                 }
 
-                if (success)
+                if (string.IsNullOrEmpty(uid))
                 {
-                    Logger.WriteLog("✓ UID: " + _rfidUid);
-                    ExecuteCommandWithEnq("DC");
+                    Logger.WriteLog("× UID не получен, делаем CP и освобождаем устройство");
+                    ExecuteCommandWithEnq(_crtPort, "CP");
+                    SafeClosePorts();
+                    _deviceLock.Release();
 
-                    // Возврат карты через 17 секунд, потом освобождаем лок
+                    res.StatusCode = 200;
+                    await WriteJsonAsync(res, new { success = false, uid = (string)null, error = "UID not received", elapsedMilliseconds = (long?)sw.ElapsedMilliseconds });
+                    return;
+                }
+
+                Logger.WriteLog("✓ UID: " + uid);
+
+                // Готовим pending-операцию: ждём confirm/deny
+                var op = new PendingOp
+                {
+                    Id = Guid.NewGuid(),
+                    Uid = uid,
+                    Started = DateTime.UtcNow,
+                    Cts = new CancellationTokenSource()
+                };
+                _pending = op;
+
+                // Запускаем таймаут подтверждения
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(confirmTimeout), op.Cts.Token);
+                        if (!op.Completed)
+                        {
+                            Logger.WriteLog("⏰ Таймаут подтверждения. Делаем CP и завершаем.");
+                            ExecuteCommandWithEnq(_crtPort, "CP");
+                            CompleteAndCleanup();
+                        }
+                    }
+                    catch (TaskCanceledException) { /* ок, подтверждение пришло */ }
+                });
+
+                // Отдаём UID и operationId, карта пока внутри
+                res.StatusCode = 200;
+                await WriteJsonAsync(res, new
+                {
+                    success = true,
+                    uid = uid,
+                    operationId = op.Id.ToString(),
+                    timeoutSec = confirmTimeout,
+                    elapsedMilliseconds = (long?)sw.ElapsedMilliseconds
+                });
+            }
+            catch (Exception ex)
+            {
+                // Аварийно прибираем
+                try { ExecuteCommandWithEnq(_crtPort, "CP"); } catch { }
+                SafeClosePorts();
+                _deviceLock.Release();
+                _pending = null;
+
+                res.StatusCode = 500;
+                await WriteJsonAsync(res, new { success = false, error = ex.Message });
+            }
+        }
+
+        // ---------- ФАЗА 2: подтверждение ----------
+        static async Task HandleIssueConfirmAsync(HttpListenerContext context)
+        {
+            var req = context.Request;
+            var res = context.Response;
+
+            string body;
+            using (var sr = new StreamReader(req.InputStream, req.ContentEncoding))
+                body = sr.ReadToEnd();
+
+            string opId = null;
+            bool allow = false;
+
+            try
+            {
+                var json = JsonDocument.Parse(body);
+                if (json.RootElement.TryGetProperty("operationId", out var idProp))
+                    opId = idProp.GetString();
+                if (json.RootElement.TryGetProperty("allow", out var allowProp))
+                    allow = allowProp.GetBoolean();
+            }
+            catch
+            {
+                res.StatusCode = 400;
+                await WriteJsonAsync(res, new { error = "Invalid JSON. Expected { operationId, allow }" });
+                return;
+            }
+
+            if (_pending == null || _pending.Completed)
+            {
+                res.StatusCode = 410; // Gone
+                await WriteJsonAsync(res, new { error = "No pending operation" });
+                return;
+            }
+            if (!string.Equals(_pending.Id.ToString(), opId, StringComparison.OrdinalIgnoreCase))
+            {
+                res.StatusCode = 409;
+                await WriteJsonAsync(res, new { error = "operationId mismatch" });
+                return;
+            }
+
+            try
+            {
+                _pending.Cts.Cancel(); // останавливаем таймаут
+
+                if (allow)
+                {
+                    Logger.WriteLog("✔ Подтверждение получено: плюём карту (DC).");
+                    ExecuteCommandWithEnq(_crtPort, "DC");
+
+                    // Если нужен авто-ретракт через 17 сек — оставляем. Иначе закомментируй.
                     Task.Run(() =>
                     {
                         try
                         {
-                            Logger.WriteLog("⏳ Ждём 17 секунд перед CP...");
+                            Logger.WriteLog("⏳ Ждём 17 секунд, затем CP (если не забрали).");
                             Thread.Sleep(17000);
-                            ExecuteCommandWithEnq("CP");
-                            Logger.WriteLog("✓ Карта возвращена (CP).");
+                            ExecuteCommandWithEnq(_crtPort, "CP");
                         }
                         catch (Exception ex)
                         {
-                            Logger.WriteLog("! Ошибка при возврате карты: " + ex.Message);
+                            Logger.WriteLog("! Ошибка при CP после DC: " + ex.Message);
                         }
                         finally
                         {
-                            try { if (_crtPort?.IsOpen == true) _crtPort.Close(); } catch { }
-                            try { if (_rfidPort?.IsOpen == true) _rfidPort.Close(); } catch { }
-                            _semaphore.Release();
+                            CompleteAndCleanup();
                         }
                     });
+
+                    res.StatusCode = 200;
+                    await WriteJsonAsync(res, new { success = true, action = "dispensed", uid = _pending.Uid });
                 }
                 else
                 {
-                    Logger.WriteLog("× UID не получен, выполняем CP и отпускаем лок");
-                    ExecuteCommandWithEnq("CP");
-                    try { if (_crtPort?.IsOpen == true) _crtPort.Close(); } catch { }
-                    try { if (_rfidPort?.IsOpen == true) _rfidPort.Close(); } catch { }
-                    _semaphore.Release();
+                    Logger.WriteLog("✖ Отклонено сервером: делаем CP.");
+                    ExecuteCommandWithEnq(_crtPort, "CP");
+                    CompleteAndCleanup();
+
+                    res.StatusCode = 200;
+                    await WriteJsonAsync(res, new { success = true, action = "returned" });
                 }
             }
             catch (Exception ex)
             {
-                // аварийно закрываем и освобождаем лок
-                try { if (_crtPort?.IsOpen == true) _crtPort.Close(); } catch { }
-                try { if (_rfidPort?.IsOpen == true) _rfidPort.Close(); } catch { }
-                _semaphore.Release();
+                // аварийно прибираем, чтобы не повиснуть
+                try { ExecuteCommandWithEnq(_crtPort, "CP"); } catch { }
+                CompleteAndCleanup();
 
-                return new
-                {
-                    success = false,
-                    uid = (string)null,
-                    error = ex.Message,
-                    elapsedMilliseconds = _elapsedMilliseconds >= 0 ? _elapsedMilliseconds : null
-                };
+                res.StatusCode = 500;
+                await WriteJsonAsync(res, new { success = false, error = ex.Message });
             }
-
-            return new
-            {
-                success = success,
-                uid = success ? _rfidUid : null,
-                error = success ? null : "UID not received",
-                elapsedMilliseconds = _elapsedMilliseconds >= 0 ? _elapsedMilliseconds : null
-            };
         }
 
+        // ---------- Статус устройства (как у тебя было) ----------
         static async Task HandleStatusRequestAsync(HttpListenerContext context)
         {
             var response = context.Response;
-            await _semaphore.WaitAsync();
+            await _deviceLock.WaitAsync();
             try
             {
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -224,12 +314,10 @@ namespace TerminalCardReader
                     byte[] ap = new byte[] { 0x02, (byte)'A', (byte)'P', 0x03, (byte)(0x02 ^ (byte)'A' ^ (byte)'P' ^ 0x03) };
                     port.Write(ap, 0, ap.Length);
 
-                    // ACK
                     var ack = new byte[1];
                     port.Read(ack, 0, 1);
                     if (ack[0] != 0x06) throw new Exception("Нет ACK");
 
-                    // ENQ → ждём ответ
                     Thread.Sleep(50);
                     port.Write(new byte[] { 0x05 }, 0, 1);
                     Thread.Sleep(100);
@@ -256,11 +344,23 @@ namespace TerminalCardReader
             }
             finally
             {
-                _semaphore.Release();
+                _deviceLock.Release();
             }
         }
 
-        // ======== НИЖЕ — утилиты ========
+        // ---------- Вспомогательные ----------
+        static void CompleteAndCleanup()
+        {
+            try { SafeClosePorts(); } catch { }
+            _pending = null;
+            try { _deviceLock.Release(); } catch { }
+        }
+
+        static void SafeClosePorts()
+        {
+            try { if (_rfidPort != null && _rfidPort.IsOpen) _rfidPort.Close(); } catch { }
+            try { if (_crtPort != null && _crtPort.IsOpen) _crtPort.Close(); } catch { }
+        }
 
         static string ReadBurst(SerialPort port, int initialWindowMs, int idleGapMs)
         {
@@ -311,18 +411,18 @@ namespace TerminalCardReader
             return sb.ToString();
         }
 
-        static void ExecuteCommandWithEnq(string cmd)
+        static void ExecuteCommandWithEnq(SerialPort port, string cmd)
         {
-            SendCommand(cmd);
-            if (ReadAck())
+            SendCommand(port, cmd);
+            if (ReadAck(port))
             {
                 Thread.Sleep(100);
-                _crtPort.Write(new byte[] { 0x05 }, 0, 1); // ENQ
+                port.Write(new byte[] { 0x05 }, 0, 1); // ENQ
                 Thread.Sleep(400);
             }
         }
 
-        static void ExecuteFCCommand(int position)
+        static void ExecuteFCCommand(SerialPort port, int position)
         {
             byte[] buffer = new byte[6];
             buffer[0] = 0x02;
@@ -331,16 +431,16 @@ namespace TerminalCardReader
             buffer[3] = (byte)(0x30 + position);
             buffer[4] = 0x03;
             buffer[5] = (byte)(buffer[0] ^ buffer[1] ^ buffer[2] ^ buffer[3] ^ buffer[4]);
-            _crtPort.Write(buffer, 0, buffer.Length);
-            if (ReadAck())
+            port.Write(buffer, 0, buffer.Length);
+            if (ReadAck(port))
             {
                 Thread.Sleep(100);
-                _crtPort.Write(new byte[] { 0x05 }, 0, 1);
+                port.Write(new byte[] { 0x05 }, 0, 1);
                 Thread.Sleep(400);
             }
         }
 
-        static void SendCommand(string cmd)
+        static void SendCommand(SerialPort port, string cmd)
         {
             byte[] buffer = new byte[5];
             buffer[0] = 0x02;
@@ -348,16 +448,15 @@ namespace TerminalCardReader
             buffer[2] = (byte)cmd[1];
             buffer[3] = 0x03;
             buffer[4] = (byte)(buffer[0] ^ buffer[1] ^ buffer[2] ^ buffer[3]);
-            _crtPort.Write(buffer, 0, buffer.Length);
+            port.Write(buffer, 0, buffer.Length);
         }
 
-        static bool ReadAck()
+        static bool ReadAck(SerialPort port)
         {
             try
             {
-                byte[] response = new byte[1];
-                int bytesRead = _crtPort.Read(response, 0, 1);
-                return bytesRead > 0 && response[0] == 0x06;
+                int b = port.ReadByte();
+                return b == 0x06;
             }
             catch { return false; }
         }
@@ -371,7 +470,7 @@ namespace TerminalCardReader
 
         static async Task WriteJsonAsync(HttpListenerResponse res, object obj)
         {
-            var json = System.Text.Json.JsonSerializer.Serialize(obj, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(obj, new JsonSerializerOptions { WriteIndented = true });
             var bytes = Encoding.UTF8.GetBytes(json);
             res.ContentType = "application/json; charset=utf-8";
             await res.OutputStream.WriteAsync(bytes, 0, bytes.Length);
@@ -387,5 +486,14 @@ namespace TerminalCardReader
             try { return File.Exists(path) && int.TryParse(File.ReadAllText(path).Trim(), out var v) ? v : def; }
             catch { return def; }
         }
+    }
+
+    class PendingOp
+    {
+        public Guid Id;
+        public string Uid;
+        public DateTime Started;
+        public bool Completed;
+        public CancellationTokenSource Cts;
     }
 }
