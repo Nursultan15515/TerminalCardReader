@@ -1,10 +1,10 @@
-using System;
+Ôªøusing System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Ports;
 using System.Net;
 using System.Text;
-using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -12,94 +12,96 @@ namespace TerminalCardReader
 {
     class Program
     {
-        static SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+        // –û–¥–∏–Ω –æ–±—â–∏–π –ª–æ–∫, —á—Ç–æ–±—ã –Ω–µ –ø—É—Å–∫–∞—Ç—å –ø–∞—Ä–∞–ª–ª–µ–ª—å–Ω—ã–µ /issue-card –∏ /card-status
+        static readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+
         static SerialPort _crtPort;
         static SerialPort _rfidPort;
         static string _rfidUid = null;
-        static bool _rfidReceived = false;
         static long? _elapsedMilliseconds = -1;
-        static bool isCardEnd = false;
         static Stopwatch stopwatch;
 
         static void Main(string[] args)
         {
-            HttpListener listener = new HttpListener();
+            var listener = new HttpListener();
             listener.Prefixes.Add("http://localhost:8080/issue-card/");
             listener.Prefixes.Add("http://localhost:8080/card-status/");
             listener.Start();
-            Console.WriteLine("—Â‚Â Á‡ÔÛ˘ÂÌ: http://localhost:8080/issue-card/");
+            Console.WriteLine("–°–µ—Ä–≤–µ—Ä –∑–∞–ø—É—â–µ–Ω: http://localhost:8080/issue-card/");
 
             while (true)
             {
-                HttpListenerContext context = listener.GetContext();
-                _ = Task.Run(() =>
-                {
-                    if (context.Request.Url.AbsolutePath == "/issue-card/")
-                        HandleRequestAsync(context);
-                    else if (context.Request.Url.AbsolutePath == "/card-status/")
-                        HandleStatusRequestAsync(context);
-                    else
-                        context.Response.StatusCode = 404;
-                });
+                var context = listener.GetContext();
+                _ = Task.Run(() => RouteAsync(context));
             }
+        }
 
+        static async Task RouteAsync(HttpListenerContext context)
+        {
+            var req = context.Request;
+            var res = context.Response;
+
+            // CORS
+            res.AddHeader("Access-Control-Allow-Origin", "*");
+            res.AddHeader("Access-Control-Allow-Headers", "*");
+            res.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            if (req.HttpMethod == "OPTIONS") { res.StatusCode = 200; res.Close(); return; }
+
+            try
+            {
+                if (req.Url.AbsolutePath == "/issue-card/")
+                {
+                    if (req.HttpMethod != "POST") { res.StatusCode = 405; await WriteTextAsync(res, "Method Not Allowed"); return; }
+                    await HandleRequestAsync(context);
+                }
+                else if (req.Url.AbsolutePath == "/card-status/")
+                {
+                    if (req.HttpMethod != "GET" && req.HttpMethod != "POST") { res.StatusCode = 405; await WriteTextAsync(res, "Method Not Allowed"); return; }
+                    await HandleStatusRequestAsync(context);
+                }
+                else
+                {
+                    res.StatusCode = 404; await WriteTextAsync(res, "Not Found");
+                }
+            }
+            catch (Exception ex)
+            {
+                try { res.StatusCode = 500; await WriteJsonAsync(res, new { error = ex.Message }); } catch { }
+            }
+            finally
+            {
+                try { res.OutputStream.Close(); } catch { }
+            }
         }
 
         static async Task HandleRequestAsync(HttpListenerContext context)
         {
+            await _semaphore.WaitAsync(); // –±–ª–æ–∫–∏—Ä—É–µ–º –¥–æ –ø–æ–ª–Ω–æ–≥–æ –∑–∞–≤–µ—Ä—à–µ–Ω–∏—è —Å—Ü–µ–Ω–∞—Ä–∏—è
             var response = context.Response;
+
             try
             {
-                response.AddHeader("Access-Control-Allow-Origin", "*");
-                response.AddHeader("Access-Control-Allow-Headers", "*");
-                response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-
-                if (context.Request.HttpMethod != "POST")
-                {
-                    response.StatusCode = 405;
-                    byte[] msg = Encoding.UTF8.GetBytes("Method Not Allowed");
-                    response.OutputStream.Write(msg, 0, msg.Length);
-                    response.Close();
-                    return;
-                }
-
-                await _semaphore.WaitAsync(); // ¡ÎÓÍËÓ‚Í‡
-
-                var result = RunCardLogic(); // JSON ‚ÓÁ‚‡˘‡ÂÚÒˇ ·˚ÒÚÓ
-
-                string json = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
-                byte[] buffer = Encoding.UTF8.GetBytes(json);
-                response.ContentType = "application/json";
-                response.ContentLength64 = buffer.Length;
-                response.OutputStream.Write(buffer, 0, buffer.Length);
+                var result = RunCardLogic(); // —Ñ–æ—Ä–º–∏—Ä—É–µ–º —Ä–µ–∑—É–ª—å—Ç–∞—Ç –±—ã—Å—Ç—Ä–æ (–Ω–æ –ª–æ–∫ –¥–µ—Ä–∂–∏–º –¥–æ CP)
+                await WriteJsonAsync(response, result);
             }
             catch (Exception ex)
             {
                 response.StatusCode = 500;
-                string jsonError = JsonSerializer.Serialize(new { error = ex.Message });
-                byte[] buffer = Encoding.UTF8.GetBytes(jsonError);
-                response.OutputStream.Write(buffer, 0, buffer.Length);
+                await WriteJsonAsync(response, new { success = false, uid = (string)null, error = ex.Message, elapsedMilliseconds = _elapsedMilliseconds });
             }
-            finally
-            {
-                response.OutputStream.Close();
-                // ? ÕÂ ÓÒ‚Ó·ÓÊ‰‡ÂÏ ÒÂÏ‡ÙÓ Á‰ÂÒ¸ ó ÚÓÎ¸ÍÓ ÔÓÒÎÂ ‚ÓÁ‚‡Ú‡ Í‡Ú˚!
-            }
+            // –ù–ï –æ—Å–≤–æ–±–æ–∂–¥–∞–µ–º —Å–µ–º–∞—Ñ–æ—Ä –∑–¥–µ—Å—å ‚Äî –æ–Ω –æ—Ç–ø—É—Å–∫–∞–µ—Ç—Å—è –≤–Ω—É—Ç—Ä–∏ —Ñ–æ–Ω–æ–≤–æ–π –∑–∞–¥–∞—á–∏ –ø–æ—Å–ª–µ CP/–∑–∞–∫—Ä—ã—Ç–∏—è –ø–æ—Ä—Ç–æ–≤
         }
 
         static object RunCardLogic()
         {
             _rfidUid = null;
-            _rfidReceived = false;
             _elapsedMilliseconds = -1;
-            isCardEnd = false;
 
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            string crtPortFile = Path.Combine(baseDir, "crt_port.txt");
-            string rfidPortFile = Path.Combine(baseDir, "rfid_port.txt");
-
-            string crtPortName = File.Exists(crtPortFile) ? File.ReadAllText(crtPortFile).Trim() : "COM5";
-            string rfidPortName = File.Exists(rfidPortFile) ? File.ReadAllText(rfidPortFile).Trim() : "COM4";
+            string crtPortName = ReadOrDefault(Path.Combine(baseDir, "crt_port.txt"), "COM5");
+            string rfidPortName = ReadOrDefault(Path.Combine(baseDir, "rfid_port.txt"), "COM4");
+            int initialWindowMs = ReadOrDefaultInt(Path.Combine(baseDir, "initial_window.txt"), 250);
+            int idleGapMs = ReadOrDefaultInt(Path.Combine(baseDir, "idle_gap.txt"), 120);
 
             _crtPort = new SerialPort(crtPortName, 9600, Parity.None, 8, StopBits.One)
             {
@@ -107,41 +109,12 @@ namespace TerminalCardReader
                 WriteTimeout = 1000
             };
 
-            _rfidPort = new SerialPort(rfidPortName, 9600, Parity.None, 8, StopBits.One);
-            _rfidPort.DataReceived += (s, e) =>
+            _rfidPort = new SerialPort(rfidPortName, 9600, Parity.None, 8, StopBits.One)
             {
-                try
-                {
-                    string data = _rfidPort.ReadExisting().Trim();
-                    if (!string.IsNullOrWhiteSpace(data))
-                    {
-                        if (data == "No Card")
-                        {
-                            isCardEnd = true;
-                        }
-                        else if (!_rfidReceived)
-                        {
-                            if (data.StartsWith("HID["))
-                            {
-                                var parts = data.Split(' ');
-                                _rfidUid = parts.Length > 1 ? parts[1] : data;
-                            }
-                            else
-                            {
-                                _rfidUid = data;
-                            }
-
-                            _rfidReceived = true;
-                            stopwatch.Stop();
-                            _elapsedMilliseconds = stopwatch.ElapsedMilliseconds;
-                        }
-                    }
-                }
-                catch { }
+                Encoding = Encoding.ASCII,
+                ReadTimeout = 80
             };
 
-            int maxAttempts = 3;
-            int attempt = 0;
             bool success = false;
 
             try
@@ -149,74 +122,77 @@ namespace TerminalCardReader
                 _crtPort.Open();
                 _rfidPort.Open();
 
-                while (attempt < maxAttempts && !_rfidReceived)
+                Logger.WriteLog($"‚Üí FC (–ø–æ–¥–∞—á–∞ –∫–∞—Ä—Ç—ã), COM CRT={crtPortName}, RFID={rfidPortName}; win={initialWindowMs}/{idleGapMs} –º—Å");
+                ExecuteFCCommand(2);
+
+                stopwatch = Stopwatch.StartNew();
+
+                // Burst-—á—Ç–µ–Ω–∏–µ –æ—Ç–≤–µ—Ç–∞ –æ—Ç —Å—á–∏—Ç—ã–≤–∞—Ç–µ–ª—è
+                string frame = ReadBurst(_rfidPort, initialWindowMs, idleGapMs);
+                frame = (frame ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+
+                if (!string.IsNullOrEmpty(frame) && frame.IndexOf("No Card", StringComparison.OrdinalIgnoreCase) < 0)
                 {
-                    attempt++;
-                    Logger.WriteLog($"?? œÓÔ˚ÚÍ‡ #{attempt}");
-
-                    ExecuteFCCommand(2);
-
-                    stopwatch = Stopwatch.StartNew();
-                    int timeout = 10000;
-                    int waited = 0;
-                    while (!_rfidReceived && waited < timeout)
+                    // –≤—ã–±—Ä–∞—Å—ã–≤–∞–µ–º HID[...] –∏ –±–µ—Ä—ë–º –ø–æ—Å–ª–µ–¥–Ω–µ–µ —á–∏—Å–ª–æ
+                    frame = Regex.Replace(frame, @"HID\[[^\]]*\]", "", RegexOptions.IgnoreCase).Trim();
+                    var matches = Regex.Matches(frame, @"\b\d+\b");
+                    if (matches.Count > 0)
                     {
-                        Thread.Sleep(200);
-                        waited += 200;
-                    }
-
-                    if (_rfidReceived)
-                    {
-                        Logger.WriteLog("? UID ÔÓÎÛ˜ÂÌ: " + _rfidUid);
-                        ExecuteCommandWithEnq("DC");
-
-                        // ? ¬ÓÁ‚‡Ú Í‡Ú˚ Ë Release ÔÓÒÎÂ 15 ÒÂÍ
-                        Task.Run(() =>
-                        {
-                            try
-                            {
-                                Logger.WriteLog("? ŒÊË‰‡ÌËÂ 17 ÒÂÍÛÌ‰ ÔÂÂ‰ ‚ÓÁ‚‡ÚÓÏ...");
-                                Thread.Sleep(17000);
-                                ExecuteCommandWithEnq("CP");
-                                Logger.WriteLog("?  ‡Ú‡ ‚ÓÁ‚‡˘ÂÌ‡.");
-                            }
-                            catch (Exception ex)
-                            {
-                                Logger.WriteLog("? Œ¯Ë·Í‡ ‚ÓÁ‚‡Ú‡ Í‡Ú˚: " + ex.Message);
-                            }
-                            finally
-                            {
-                                if (_crtPort?.IsOpen == true) _crtPort.Close();
-                                if (_rfidPort?.IsOpen == true) _rfidPort.Close();
-
-                                // ? —ÂÏ‡ÙÓ ÓÒ‚Ó·ÓÊ‰‡ÂÏ “ŒÀ‹ Œ Á‰ÂÒ¸
-                                _semaphore.Release();
-                            }
-                        });
-
+                        _rfidUid = matches[matches.Count - 1].Value;
+                        _elapsedMilliseconds = stopwatch.ElapsedMilliseconds;
                         success = true;
-                        break;
                     }
-                    else
+                }
+
+                if (success)
+                {
+                    Logger.WriteLog("‚úì UID: " + _rfidUid);
+                    ExecuteCommandWithEnq("DC");
+
+                    // –í–æ–∑–≤—Ä–∞—Ç –∫–∞—Ä—Ç—ã —á–µ—Ä–µ–∑ 17 —Å–µ–∫—É–Ω–¥, –ø–æ—Ç–æ–º –æ—Å–≤–æ–±–æ–∂–¥–∞–µ–º –ª–æ–∫
+                    Task.Run(() =>
                     {
-                        Logger.WriteLog("? UID ÌÂ ÔÓÎÛ˜ÂÌ, ‚ÓÁ‚‡Ú Í‡Ú˚...");
-                        ExecuteCommandWithEnq("CP");
-                        _crtPort.Close();
-                        _rfidPort.Close();
-                        _semaphore.Release(); // ? ŒÒ‚Ó·ÓÊ‰‡ÂÏ Ò‡ÁÛ ÔË ÌÂÛ‰‡˜Â
-                    }
+                        try
+                        {
+                            Logger.WriteLog("‚è≥ –ñ–¥—ë–º 17 —Å–µ–∫—É–Ω–¥ –ø–µ—Ä–µ–¥ CP...");
+                            Thread.Sleep(17000);
+                            ExecuteCommandWithEnq("CP");
+                            Logger.WriteLog("‚úì –ö–∞—Ä—Ç–∞ –≤–æ–∑–≤—Ä–∞—â–µ–Ω–∞ (CP).");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.WriteLog("! –û—à–∏–±–∫–∞ –ø—Ä–∏ –≤–æ–∑–≤—Ä–∞—Ç–µ –∫–∞—Ä—Ç—ã: " + ex.Message);
+                        }
+                        finally
+                        {
+                            try { if (_crtPort?.IsOpen == true) _crtPort.Close(); } catch { }
+                            try { if (_rfidPort?.IsOpen == true) _rfidPort.Close(); } catch { }
+                            _semaphore.Release();
+                        }
+                    });
+                }
+                else
+                {
+                    Logger.WriteLog("√ó UID –Ω–µ –ø–æ–ª—É—á–µ–Ω, –≤—ã–ø–æ–ª–Ω—è–µ–º CP –∏ –æ—Ç–ø—É—Å–∫–∞–µ–º –ª–æ–∫");
+                    ExecuteCommandWithEnq("CP");
+                    try { if (_crtPort?.IsOpen == true) _crtPort.Close(); } catch { }
+                    try { if (_rfidPort?.IsOpen == true) _rfidPort.Close(); } catch { }
+                    _semaphore.Release();
                 }
             }
             catch (Exception ex)
             {
-                _semaphore.Release(); // ?? œË ÍËÚË˜ÂÒÍÓÈ Ó¯Ë·ÍÂ ó ÚÓÊÂ ÓÚÔÛÒÍ‡ÂÏ
+                // –∞–≤–∞—Ä–∏–π–Ω–æ –∑–∞–∫—Ä—ã–≤–∞–µ–º –∏ –æ—Å–≤–æ–±–æ–∂–¥–∞–µ–º –ª–æ–∫
+                try { if (_crtPort?.IsOpen == true) _crtPort.Close(); } catch { }
+                try { if (_rfidPort?.IsOpen == true) _rfidPort.Close(); } catch { }
+                _semaphore.Release();
+
                 return new
                 {
                     success = false,
                     uid = (string)null,
                     error = ex.Message,
-                    elapsedMilliseconds = _elapsedMilliseconds >= 0 ? _elapsedMilliseconds : null,
-                    attempts = attempt
+                    elapsedMilliseconds = _elapsedMilliseconds >= 0 ? _elapsedMilliseconds : null
                 };
             }
 
@@ -224,11 +200,115 @@ namespace TerminalCardReader
             {
                 success = success,
                 uid = success ? _rfidUid : null,
-                error = success ? null : "UID not received after retries",
-                elapsedMilliseconds = _elapsedMilliseconds >= 0 ? _elapsedMilliseconds : null,
-                isCardEnd = isCardEnd,
-                attempts = attempt
+                error = success ? null : "UID not received",
+                elapsedMilliseconds = _elapsedMilliseconds >= 0 ? _elapsedMilliseconds : null
             };
+        }
+
+        static async Task HandleStatusRequestAsync(HttpListenerContext context)
+        {
+            var response = context.Response;
+            await _semaphore.WaitAsync();
+            try
+            {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string crtPortName = ReadOrDefault(Path.Combine(baseDir, "crt_port.txt"), "COM5");
+
+                int status;
+                using (var port = new SerialPort(crtPortName, 9600, Parity.None, 8, StopBits.One))
+                {
+                    port.ReadTimeout = 1000;
+                    port.WriteTimeout = 1000;
+                    port.Open();
+
+                    byte[] ap = new byte[] { 0x02, (byte)'A', (byte)'P', 0x03, (byte)(0x02 ^ (byte)'A' ^ (byte)'P' ^ 0x03) };
+                    port.Write(ap, 0, ap.Length);
+
+                    // ACK
+                    var ack = new byte[1];
+                    port.Read(ack, 0, 1);
+                    if (ack[0] != 0x06) throw new Exception("–ù–µ—Ç ACK");
+
+                    // ENQ ‚Üí –∂–¥—ë–º –æ—Ç–≤–µ—Ç
+                    Thread.Sleep(50);
+                    port.Write(new byte[] { 0x05 }, 0, 1);
+                    Thread.Sleep(100);
+
+                    byte[] buffer = new byte[12];
+                    int read = port.Read(buffer, 0, buffer.Length);
+                    if (read < 7 || buffer[0] != 0x02 || buffer[1] != (byte)'S' || buffer[2] != (byte)'F')
+                        throw new Exception("–ù–µ–≤–µ—Ä–Ω—ã–π —Ñ–æ—Ä–º–∞—Ç –æ—Ç–≤–µ—Ç–∞");
+
+                    byte b5 = buffer[5];
+                    byte b6 = buffer[6];
+                    bool isPreEmpty = (b5 & 0x01) != 0;
+                    bool isEmpty = (b6 & 0x08) != 0;
+
+                    status = isEmpty ? 0 : (isPreEmpty ? 1 : 2);
+                }
+
+                await WriteJsonAsync(response, new { status });
+            }
+            catch (Exception ex)
+            {
+                response.StatusCode = 500;
+                await WriteJsonAsync(response, new { status = -1, error = ex.Message });
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        // ======== –ù–ò–ñ–ï ‚Äî —É—Ç–∏–ª–∏—Ç—ã ========
+
+        static string ReadBurst(SerialPort port, int initialWindowMs, int idleGapMs)
+        {
+            var sb = new StringBuilder(128);
+
+            // –∂–¥—ë–º –ø–µ—Ä–≤—ã–π –∫—É—Å–æ–∫
+            while (true)
+            {
+                try
+                {
+                    var chunk = port.ReadExisting();
+                    if (!string.IsNullOrEmpty(chunk)) { sb.Append(chunk); break; }
+                    Thread.Sleep(5);
+                }
+                catch (TimeoutException) { }
+            }
+
+            int start = Environment.TickCount;
+            int lastData = Environment.TickCount;
+
+            while (true)
+            {
+                try
+                {
+                    var chunk = port.ReadExisting();
+                    if (!string.IsNullOrEmpty(chunk))
+                    {
+                        sb.Append(chunk);
+                        lastData = Environment.TickCount;
+                    }
+                    else
+                    {
+                        if (Environment.TickCount - lastData >= idleGapMs) break;
+                    }
+                }
+                catch (TimeoutException)
+                {
+                    if (Environment.TickCount - lastData >= idleGapMs) break;
+                }
+
+                if ((Environment.TickCount - start) >= initialWindowMs &&
+                    (Environment.TickCount - lastData) >= idleGapMs)
+                    break;
+
+                Thread.Sleep(5);
+            }
+
+            return sb.ToString();
         }
 
         static void ExecuteCommandWithEnq(string cmd)
@@ -237,7 +317,7 @@ namespace TerminalCardReader
             if (ReadAck())
             {
                 Thread.Sleep(100);
-                _crtPort.Write(new byte[] { 0x05 }, 0, 1);
+                _crtPort.Write(new byte[] { 0x05 }, 0, 1); // ENQ
                 Thread.Sleep(400);
             }
         }
@@ -282,79 +362,30 @@ namespace TerminalCardReader
             catch { return false; }
         }
 
-        static async Task HandleStatusRequestAsync(HttpListenerContext context)
+        static async Task WriteTextAsync(HttpListenerResponse res, string text)
         {
-            var response = context.Response;
-            await _semaphore.WaitAsync();
+            var bytes = Encoding.UTF8.GetBytes(text);
+            res.ContentType = "text/plain; charset=utf-8";
+            await res.OutputStream.WriteAsync(bytes, 0, bytes.Length);
+        }
 
-            try
-            {
-                response.AddHeader("Access-Control-Allow-Origin", "*");
-                response.AddHeader("Access-Control-Allow-Headers", "*");
-                response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        static async Task WriteJsonAsync(HttpListenerResponse res, object obj)
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(obj, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            var bytes = Encoding.UTF8.GetBytes(json);
+            res.ContentType = "application/json; charset=utf-8";
+            await res.OutputStream.WriteAsync(bytes, 0, bytes.Length);
+        }
 
-                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string crtPortFile = Path.Combine(baseDir, "crt_port.txt");
-                string crtPortName = File.Exists(crtPortFile) ? File.ReadAllText(crtPortFile).Trim() : "COM5";
-
-                int status = 0;
-
-                using (var port = new SerialPort(crtPortName, 9600, Parity.None, 8, StopBits.One))
-                {
-                    port.ReadTimeout = 1000;
-                    port.WriteTimeout = 1000;
-                    port.Open();
-
-                    byte[] apCommand = new byte[]
-                    {
-                0x02, (byte)'A', (byte)'P', 0x03,
-                (byte)(0x02 ^ (byte)'A' ^ (byte)'P' ^ 0x03)
-                    };
-
-                    port.Write(apCommand, 0, apCommand.Length);
-
-                    byte[] ack = new byte[1];
-                    port.Read(ack, 0, 1);
-                    if (ack[0] != 0x06)
-                        throw new Exception("ÕÂÚ ACK");
-
-                    Thread.Sleep(50);
-                    port.Write(new byte[] { 0x05 }, 0, 1);
-
-                    Thread.Sleep(100);
-                    byte[] buffer = new byte[12];
-                    int bytesRead = port.Read(buffer, 0, buffer.Length);
-                    if (bytesRead < 7 || buffer[0] != 0x02 || buffer[1] != (byte)'S' || buffer[2] != (byte)'F')
-                        throw new Exception("ÕÂ‚ÂÌ˚È ÙÓÏ‡Ú ÓÚ‚ÂÚ‡");
-
-                    byte byte5 = buffer[5];
-                    byte byte6 = buffer[6];
-
-                    bool isPreEmpty = (byte5 & 0x01) != 0; // Byte5, bit 0
-                    bool isEmpty = (byte6 & 0x08) != 0;     // Byte6, bit 3
-
-                    status = isEmpty ? 0 : isPreEmpty ? 1 : 2;
-                }
-
-                var json = JsonSerializer.Serialize(new { status = status });
-                byte[] bufferOut = Encoding.UTF8.GetBytes(json);
-                response.ContentType = "application/json";
-                response.ContentLength64 = bufferOut.Length;
-                await response.OutputStream.WriteAsync(bufferOut, 0, bufferOut.Length);
-            }
-            catch (Exception ex)
-            {
-                var errorJson = JsonSerializer.Serialize(new { status = -1, error = ex.Message });
-                byte[] bufferOut = Encoding.UTF8.GetBytes(errorJson);
-                response.ContentType = "application/json";
-                response.StatusCode = 500;
-                await response.OutputStream.WriteAsync(bufferOut, 0, bufferOut.Length);
-            }
-            finally
-            {
-                response.OutputStream.Close();
-                _semaphore.Release();
-            }
+        static string ReadOrDefault(string path, string def)
+        {
+            try { return File.Exists(path) ? File.ReadAllText(path).Trim() : def; }
+            catch { return def; }
+        }
+        static int ReadOrDefaultInt(string path, int def)
+        {
+            try { return File.Exists(path) && int.TryParse(File.ReadAllText(path).Trim(), out var v) ? v : def; }
+            catch { return def; }
         }
     }
 }
