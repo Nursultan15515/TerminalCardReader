@@ -257,7 +257,7 @@ namespace TerminalCardReader
                         try
                         {
                             Logger.WriteLog("⏳ Ждём 17 секунд, затем CP (если не забрали).");
-                            Thread.Sleep(17000);
+                            Thread.Sleep(15000);
                             ExecuteCommandWithEnq(_crtPort, "CP");
                         }
                         catch (Exception ex)
