@@ -100,7 +100,7 @@ namespace TerminalCardReader
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
                 string crtPortName = ReadOrDefault(Path.Combine(baseDir, "crt_port.txt"), "COM5");
                 string rfidPortName = ReadOrDefault(Path.Combine(baseDir, "rfid_port.txt"), "COM4");
-                int initialWindowMs = ReadOrDefaultInt(Path.Combine(baseDir, "initial_window.txt"), 250);
+                int initialWindowMs = ReadOrDefaultInt(Path.Combine(baseDir, "initial_window.txt"), 15000);
                 int idleGapMs = ReadOrDefaultInt(Path.Combine(baseDir, "idle_gap.txt"), 120);
                 int confirmTimeout = ReadOrDefaultInt(Path.Combine(baseDir, "confirm_timeout.txt"), 30); // сек
 
@@ -118,7 +118,7 @@ namespace TerminalCardReader
                 _crtPort.Open();
                 _rfidPort.Open();
 
-                Logger.WriteLog($"→ FC (подача карты), CRT={crtPortName}, RFID={rfidPortName}; win={initialWindowMs}/{idleGapMs} мс");
+                Logger.WriteLog($"→ FC (подача карты), CRT={crtPortName}, RFID={rfidPortName}; idleGapMs={idleGapMs}");
                 ExecuteFCCommand(_crtPort, 2);
 
                 var sw = Stopwatch.StartNew();
@@ -256,7 +256,7 @@ namespace TerminalCardReader
                     {
                         try
                         {
-                            Logger.WriteLog("⏳ Ждём 17 секунд, затем CP (если не забрали).");
+                            Logger.WriteLog("⏳ Ждём 15 секунд, затем CP (если не забрали).");
                             Thread.Sleep(15000);
                             ExecuteCommandWithEnq(_crtPort, "CP");
                         }
@@ -362,49 +362,44 @@ namespace TerminalCardReader
             try { if (_crtPort != null && _crtPort.IsOpen) _crtPort.Close(); } catch { }
         }
 
-        static string ReadBurst(SerialPort port, int initialWindowMs, int idleGapMs)
+        static string ReadBurst(SerialPort port, int firstByteTimeoutMs, int idleGapMs, int maxWindowMs = 800)
         {
-            var sb = new StringBuilder(128);
+            // На всякий случай очищаем входной буфер (чтоб не читать старый мусор)
+            try { port.DiscardInBuffer(); } catch { }
 
-            // ждём первый кусок
-            while (true)
+            var sb = new StringBuilder(128);
+            var sw = Stopwatch.StartNew();
+
+            // ===== 1) Ждём первый байт не дольше firstByteTimeoutMs =====
+            while (sw.ElapsedMilliseconds < firstByteTimeoutMs)
             {
-                try
+                string chunk = port.ReadExisting();
+                if (!string.IsNullOrEmpty(chunk))
                 {
-                    var chunk = port.ReadExisting();
-                    if (!string.IsNullOrEmpty(chunk)) { sb.Append(chunk); break; }
-                    Thread.Sleep(5);
+                    sb.Append(chunk);
+                    break;
                 }
-                catch (TimeoutException) { }
+                Thread.Sleep(5);
             }
 
-            int start = Environment.TickCount;
-            int lastData = Environment.TickCount;
+            // Ничего не пришло — выходим корректно (НЕ зависаем)
+            if (sb.Length == 0) return null;
 
-            while (true)
+            // ===== 2) Дочитываем пакет до "тишины" idleGapMs или общего окна maxWindowMs =====
+            long lastDataMs = sw.ElapsedMilliseconds;
+            while (sw.ElapsedMilliseconds < maxWindowMs)
             {
-                try
+                string chunk = port.ReadExisting();
+                if (!string.IsNullOrEmpty(chunk))
                 {
-                    var chunk = port.ReadExisting();
-                    if (!string.IsNullOrEmpty(chunk))
-                    {
-                        sb.Append(chunk);
-                        lastData = Environment.TickCount;
-                    }
-                    else
-                    {
-                        if (Environment.TickCount - lastData >= idleGapMs) break;
-                    }
+                    sb.Append(chunk);
+                    lastDataMs = sw.ElapsedMilliseconds;
                 }
-                catch (TimeoutException)
+                else
                 {
-                    if (Environment.TickCount - lastData >= idleGapMs) break;
+                    if (sw.ElapsedMilliseconds - lastDataMs >= idleGapMs)
+                        break; // тишина — считаем пакет завершённым
                 }
-
-                if ((Environment.TickCount - start) >= initialWindowMs &&
-                    (Environment.TickCount - lastData) >= idleGapMs)
-                    break;
-
                 Thread.Sleep(5);
             }
 
