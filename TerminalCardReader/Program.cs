@@ -522,24 +522,4 @@ namespace TerminalCardReader
         public bool Completed;
         public CancellationTokenSource Cts;
     }
-
-    // Простой логгер в файл
-    //static class Logger
-    //{
-    //    static readonly object _sync = new object();
-    //    public static void WriteLog(string message)
-    //    {
-    //        try
-    //        {
-    //            var dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ActionLog");
-    //            Directory.CreateDirectory(dir);
-    //            var path = Path.Combine(dir, DateTime.Now.ToString("yyyy-MM-dd") + ".txt");
-    //            lock (_sync)
-    //            {
-    //                File.AppendAllText(path, $"[{DateTime.Now:HH:mm:ss}] {message}\r\n", Encoding.UTF8);
-    //            }
-    //        }
-    //        catch { /* ignore */ }
-    //    }
-    //}
 }
