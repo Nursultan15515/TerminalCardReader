@@ -434,6 +434,7 @@ namespace TerminalCardReader
             public int? CardNumber; // ← это твой «64410»
         }
 
+        // ======== PC/SC чтение (возвращаем ровно то, что отдаёт ридер) ========
         static RfidReadResult TryReadHidCardNumberViaPcsc(int timeoutMs, string readerHint = null)
         {
             var result = new RfidReadResult();
@@ -465,9 +466,9 @@ namespace TerminalCardReader
                                 var sendPci = SCardPCI.GetPci(reader.ActiveProtocol);
 
                                 foreach (var apdu in new[] {
-                                    new byte[]{0xFF,0xCA,0x00,0x00,0x00},
-                                    new byte[]{0xFF,0xCA,0x01,0x00,0x00}
-                                })
+                            new byte[]{0xFF,0xCA,0x00,0x00,0x00},
+                            new byte[]{0xFF,0xCA,0x01,0x00,0x00}
+                        })
                                 {
                                     byte[] recv = new byte[256];
                                     rc = reader.Transmit(sendPci, apdu, ref recv);
@@ -482,18 +483,21 @@ namespace TerminalCardReader
 
                                             result.ReaderName = name;
                                             result.UidHex = BitConverter.ToString(uid).Replace("-", "");
+                                            // Важно: не декодируем HID-26, возвращаем UID как пришёл
+                                            result.Facility = null;
+                                            result.CardNumber = null;
 
-                                            // HID 26-bit (H10301): первые 4 байта как BE + сдвиг 7 бит
-                                            if (uid.Length >= 4)
-                                            {
-                                                uint be = ((uint)uid[0] << 24) | ((uint)uid[1] << 16) | ((uint)uid[2] << 8) | uid[3];
-                                                uint core26 = (be >> 7) & 0x03FFFFFF;
-                                                int facility = (int)((core26 >> 16) & 0xFF);
-                                                int card = (int)(core26 & 0xFFFF);
+                                            //if (uid.Length >= 4)
+                                            //{
+                                            //    uint be = ((uint)uid[0] << 24) | ((uint)uid[1] << 16) | ((uint)uid[2] << 8) | uid[3];
+                                            //    uint core26 = (be >> 7) & 0x03FFFFFF;
+                                            //    int facility = (int)((core26 >> 16) & 0xFF);
+                                            //    int card = (int)(core26 & 0xFFFF);
 
-                                                result.Facility = facility;
-                                                result.CardNumber = card; // ← «64410»
-                                            }
+                                            //    result.Facility = facility;
+                                            //    result.CardNumber = card; // ← «64410»
+                                            //}
+
                                             return result;
                                         }
                                     }
@@ -512,6 +516,7 @@ namespace TerminalCardReader
             }
             return null;
         }
+
     }
 
     class PendingOp
