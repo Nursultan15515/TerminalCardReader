@@ -112,10 +112,10 @@ namespace TerminalCardReader
                 ExecuteFCCommand(_crtPort, 2); // подводим карту к антенне
                 var sw = Stopwatch.StartNew();
 
-                // читаем через PC/SC (до 6 сек) и декодируем HID 26-bit → card number
-                var read = TryReadHidCardNumberViaPcsc(timeoutMs: 6000, readerHint: readerHint);
+                // читаем через PC/SC (до 12.5 сек) и декодируем HID 26-bit → card number
+                var read = TryReadHidCardNumberViaPcsc(timeoutMs: 12500, readerHint: readerHint);
 
-                if (read == null || string.IsNullOrEmpty(read.UidHex) || read.CardNumber == null)
+                if (read == null || string.IsNullOrEmpty(read.UidHex))
                 {
                     Logger.WriteLog("× UID/номер карты не получен, делаем CP и освобождаем устройство");
                     ExecuteCommandWithEnq(_crtPort, "CP");
@@ -437,21 +437,26 @@ namespace TerminalCardReader
         // ======== PC/SC чтение (возвращаем ровно то, что отдаёт ридер) ========
         static RfidReadResult TryReadHidCardNumberViaPcsc(int timeoutMs, string readerHint = null)
         {
-            var result = new RfidReadResult();
             using (var ctx = ContextFactory.Instance.Establish(SCardScope.System))
             {
                 var readers = ctx.GetReaders();
                 if (readers == null || readers.Length == 0) return null;
 
+                // читаем настройку порядка байт
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string order = ReadOrDefault(Path.Combine(baseDir, "uid_order.txt"), "MSB"); // MSB | LSB | REVERSE
+                bool reverseUid = order.Equals("LSB", StringComparison.OrdinalIgnoreCase)
+                   || order.Equals("REVERSE", StringComparison.OrdinalIgnoreCase);
+
                 var ordered = readers
-                    .OrderByDescending(r =>
-                        (!string.IsNullOrWhiteSpace(readerHint) && r.IndexOf(readerHint, StringComparison.OrdinalIgnoreCase) >= 0) ||
-                        r.IndexOf("omnikey", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        r.IndexOf("contactless", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        r.IndexOf(" nfc", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        r.IndexOf(" rfid", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        r.IndexOf(" cl", StringComparison.OrdinalIgnoreCase) >= 0)
-                    .ToArray();
+                  .OrderByDescending(r =>
+                    (!string.IsNullOrWhiteSpace(readerHint) && r.IndexOf(readerHint, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                    r.IndexOf("omnikey", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    r.IndexOf("contactless", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    r.IndexOf(" nfc", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    r.IndexOf(" rfid", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    r.IndexOf(" cl", StringComparison.OrdinalIgnoreCase) >= 0)
+                  .ToArray();
 
                 var sw = Stopwatch.StartNew();
                 foreach (var name in ordered)
@@ -466,9 +471,9 @@ namespace TerminalCardReader
                                 var sendPci = SCardPCI.GetPci(reader.ActiveProtocol);
 
                                 foreach (var apdu in new[] {
-                            new byte[]{0xFF,0xCA,0x00,0x00,0x00},
-                            new byte[]{0xFF,0xCA,0x01,0x00,0x00}
-                        })
+              new byte[]{0xFF,0xCA,0x00,0x00,0x00},
+              new byte[]{0xFF,0xCA,0x01,0x00,0x00}
+            })
                                 {
                                     byte[] recv = new byte[256];
                                     rc = reader.Transmit(sendPci, apdu, ref recv);
@@ -481,31 +486,21 @@ namespace TerminalCardReader
                                             var uid = new byte[len];
                                             Array.Copy(recv, uid, len);
 
-                                            result.ReaderName = name;
-                                            result.UidHex = BitConverter.ToString(uid).Replace("-", "");
-                                            // Важно: не декодируем HID-26, возвращаем UID как пришёл
-                                            result.Facility = null;
-                                            result.CardNumber = null;
+                                            if (reverseUid) Array.Reverse(uid);
 
-                                            //if (uid.Length >= 4)
-                                            //{
-                                            //    uint be = ((uint)uid[0] << 24) | ((uint)uid[1] << 16) | ((uint)uid[2] << 8) | uid[3];
-                                            //    uint core26 = (be >> 7) & 0x03FFFFFF;
-                                            //    int facility = (int)((core26 >> 16) & 0xFF);
-                                            //    int card = (int)(core26 & 0xFFFF);
-
-                                            //    result.Facility = facility;
-                                            //    result.CardNumber = card; // ← «64410»
-                                            //}
-
-                                            return result;
+                                            return new RfidReadResult
+                                            {
+                                                ReaderName = name,
+                                                UidHex = BitConverter.ToString(uid).Replace("-", "").ToUpperInvariant(),
+                                                Facility = null,
+                                                CardNumber = null
+                                            };
                                         }
                                     }
                                 }
                             }
                             else if (rc != SCardError.NoSmartcard && rc != SCardError.RemovedCard && rc != SCardError.NotReady)
                             {
-                                // другая ошибка — к следующему ридеру
                                 break;
                             }
 
@@ -516,7 +511,6 @@ namespace TerminalCardReader
             }
             return null;
         }
-
     }
 
     class PendingOp
